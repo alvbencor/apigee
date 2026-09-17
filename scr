@@ -1,0 +1,1409 @@
+#!/usr/bin/env python3
+
+import base64
+import json
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass
+from urllib import error, request
+from urllib.parse import quote
+
+
+CONFIG_FILE = "western-config.base.json"
+LOG_DIR = "logs"
+
+ENV_MAP = {
+    "1": "dev",
+    "2": "pre",
+    "3": "pro",
+}
+
+VALID_ORGS = {
+    "cbe",
+    "cbx",
+    "cgs",
+    "cit",
+    "cit-bank",
+    "cpt",
+    "cuk",
+    "cwe",
+    "sce",
+    "scq",
+    "we-coe",
+}
+
+GRANT_MODE_MAP = {
+    "1": ["client_credentials"],
+    "2": ["urn:ietf:params:oauth:grant-type:jwt-bearer"],
+    "3": [
+        "client_credentials",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    ],
+}
+
+
+@dataclass
+class Context:
+    org: str
+    env: str
+    sos_url_base: str
+    sos_user: str
+    sos_password: str
+    apigee_url_base: str
+    apigee_user: str
+    apigee_password: str
+    developer_email: str
+    client_id: str | None
+    client_secret: str | None
+    grant_types: list[str]
+    scopes: list[str]
+    app_name: str
+    products: list[str]
+
+
+def load_config(path: str) -> dict:
+    """Carga y valida el fichero JSON de configuración."""
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            return json.load(config_file)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"No se encuentra el fichero de configuración: {path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"El fichero de configuración no contiene JSON válido: {path}. "
+            f"Línea {exc.lineno}, columna {exc.colno}: {exc.msg}"
+        ) from exc
+
+
+def setup_logger() -> logging.Logger:
+    """Configura logging en consola y fichero."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    logger = logging.getLogger("western_sync")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s"
+    )
+
+    file_handler = logging.FileHandler(
+        os.path.join(LOG_DIR, "western_sync.log"),
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+def prompt_choice(title: str, options: dict[str, str]) -> str:
+    """Solicita una opción al usuario."""
+    print(f"\n{title}")
+
+    for key, value in options.items():
+        print(f"  {key}) {value}")
+
+    while True:
+        choice = input("Opción: ").strip().lower()
+
+        if choice in options:
+            return options[choice]
+
+        print("Opción no válida.")
+
+
+def ask_scopes() -> list[str]:
+    """
+    Solicita los scopes al usuario.
+
+    Cada línea puede contener uno o varios scopes, separados por espacios
+    y/o comas (por ejemplo: "scope1 scope2", "scope1, scope2" o
+    "scope1,scope2 scope3"). Se pueden seguir introduciendo scopes en
+    líneas sucesivas; un Enter vacío termina la captura, pero solo si ya
+    se ha introducido al menos un scope.
+    """
+    print(
+        "\nIntroduce uno o varios scopes por línea, separados por "
+        "espacios y/o comas (ej: scope1 scope2, o scope1, scope2). "
+        "Pulsa Enter vacío para terminar."
+    )
+
+    scopes: list[str] = []
+
+    while True:
+        raw_value = input("Scope(s): ").strip()
+
+        if not raw_value:
+            if scopes:
+                break
+
+            print(
+                "Debes introducir al menos un scope antes de continuar."
+            )
+            continue
+
+        new_scopes = [
+            item.strip()
+            for item in re.split(r"[,\s]+", raw_value)
+            if item.strip()
+        ]
+
+        scopes.extend(new_scopes)
+
+    return scopes
+
+
+def basic_auth(user: str, password: str) -> str:
+    """Genera la cabecera HTTP Basic Authentication."""
+    credentials = f"{user}:{password}".encode("utf-8")
+    encoded_credentials = base64.b64encode(credentials).decode("utf-8")
+
+    return f"Basic {encoded_credentials}"
+
+
+def enc(value: str) -> str:
+    """Codifica un parámetro para utilizarlo en una URL."""
+    return quote(value, safe="")
+
+
+def http_json(
+    method: str,
+    url: str,
+    headers: dict,
+    body: dict | None = None,
+    timeout: int = 60,
+):
+    """
+    Ejecuta una petición HTTP y devuelve:
+
+        (HTTP status, respuesta)
+
+    La respuesta se interpreta como JSON cuando es posible.
+    """
+    data = None
+    request_headers = dict(headers)
+
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        request_headers.setdefault(
+            "Content-Type",
+            "application/json",
+        )
+
+    http_request = request.Request(
+        url=url,
+        data=data,
+        headers=request_headers,
+        method=method,
+    )
+
+    try:
+        with request.urlopen(
+            http_request,
+            timeout=timeout,
+        ) as response:
+            raw_response = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            if not raw_response.strip():
+                return response.status, None
+
+            try:
+                return response.status, json.loads(raw_response)
+            except json.JSONDecodeError:
+                return response.status, raw_response
+
+    except error.HTTPError as exc:
+        raw_response = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        raise RuntimeError(
+            f"HTTP {exc.code} calling {url}: {raw_response}"
+        ) from exc
+
+    except error.URLError as exc:
+        raise RuntimeError(
+            f"URL error calling {url}: {exc.reason}"
+        ) from exc
+
+
+def validate_environment_config(
+    cfg: dict,
+    org: str,
+    env: str,
+) -> None:
+    """Comprueba la configuración para una organización y un entorno."""
+    if "apigee" not in cfg:
+        raise ValueError(
+            "Falta la sección global 'apigee' en el fichero de configuración."
+        )
+
+    if env not in cfg["apigee"]:
+        raise ValueError(
+            f"No existe configuración global de Apigee para env='{env}'."
+        )
+
+    apigee_credentials = cfg["apigee"][env]
+
+    for key in ("user", "password"):
+        if not apigee_credentials.get(key):
+            raise ValueError(
+                f"Falta apigee.{env}.{key} en el fichero de configuración."
+            )
+
+    if "orgs" not in cfg or org not in cfg["orgs"]:
+        raise ValueError(
+            f"No existe configuración para org='{org}'."
+        )
+
+    org_cfg = cfg["orgs"][org]
+
+    if env not in org_cfg.get("apigee", {}):
+        raise ValueError(
+            f"Falta orgs.{org}.apigee.{env} en el fichero de configuración."
+        )
+
+    org_apigee_cfg = org_cfg["apigee"][env]
+
+    for key in ("url_base", "developer_email"):
+        if not org_apigee_cfg.get(key):
+            raise ValueError(
+                f"Falta orgs.{org}.apigee.{env}.{key} "
+                "en el fichero de configuración."
+            )
+
+    if env not in org_cfg.get("sos", {}):
+        raise ValueError(
+            f"Falta orgs.{org}.sos.{env} en el fichero de configuración."
+        )
+
+    sos_cfg = org_cfg["sos"][env]
+
+    for key in ("url_base", "user", "password"):
+        if not sos_cfg.get(key):
+            raise ValueError(
+                f"Falta orgs.{org}.sos.{env}.{key} "
+                "en el fichero de configuración."
+            )
+
+
+def ask_org() -> str:
+    """Solicita la organización y valida que esté en el catálogo permitido."""
+    valid_orgs_list = ", ".join(sorted(VALID_ORGS))
+
+    while True:
+        org = input("Organización (ej: cuk): ").strip().lower()
+
+        if org in VALID_ORGS:
+            return org
+
+        print(
+            f"Organización no válida: '{org}'. "
+            f"Organizaciones permitidas: {valid_orgs_list}"
+        )
+
+
+def check_client_id_exists(
+    sos_url_base: str,
+    sos_user: str,
+    sos_password: str,
+    client_id: str,
+    logger: logging.Logger,
+) -> bool:
+    """
+    Comprueba en SOS si un clientId ya existe, antes de intentar crearlo.
+
+    Usa la misma URL que la creación (POST .../sos/manager/oauth/clients)
+    pero en GET, añadiendo el clientId al final:
+
+        GET https://{sos_url_base}/sos/manager/oauth/clients/{clientId}
+
+    Devuelve True si el clientId ya existe (HTTP 200), False si no
+    (HTTP 404). Cualquier otro código de error se propaga como excepción.
+    """
+    url = (
+        f"https://{sos_url_base}"
+        "/sos/manager/oauth/clients/"
+        f"{enc(client_id)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(sos_user, sos_password),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Comprobando si el clientId '%s' ya existe en SOS: %s",
+        client_id,
+        url,
+    )
+
+    http_request = request.Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=60) as response:
+            exists = response.status == 200
+
+            logger.info(
+                "Respuesta comprobación clientId '%s': HTTP %s",
+                client_id,
+                response.status,
+            )
+
+            return exists
+
+    except error.HTTPError as exc:
+        if exc.code == 404:
+            logger.info(
+                "El clientId '%s' no existe todavía en SOS (HTTP 404).",
+                client_id,
+            )
+            return False
+
+        raw_response = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {exc.code} comprobando clientId '{client_id}' en SOS: "
+            f"{raw_response}"
+        ) from exc
+
+    except error.URLError as exc:
+        raise RuntimeError(
+            f"Error de red comprobando clientId '{client_id}' en SOS: "
+            f"{exc.reason}"
+        ) from exc
+
+
+def get_context(cfg: dict, logger: logging.Logger) -> Context:
+    org = ask_org()
+
+    if "orgs" not in cfg or org not in cfg["orgs"]:
+        supported_orgs = ", ".join(sorted(cfg.get("orgs", {}).keys()))
+        raise ValueError(
+            f"No existe configuración para la organización '{org}' "
+            f"en el fichero {CONFIG_FILE}. "
+            f"Organizaciones con configuración disponible: {supported_orgs}"
+        )
+
+    env = prompt_choice(
+        "Selecciona entorno:",
+        ENV_MAP,
+    )
+
+    validate_environment_config(cfg, org, env)
+
+    org_cfg = cfg["orgs"][org]
+    apigee_credentials = cfg["apigee"][env]
+    org_apigee_cfg = org_cfg["apigee"][env]
+    sos_cfg = org_cfg["sos"][env]
+
+    client_id_input = input(
+        "Client ID (vacío = lo genera SOS): "
+    ).strip()
+    client_id = client_id_input or None
+
+    if client_id_input and check_client_id_exists(
+        sos_cfg["url_base"],
+        sos_cfg["user"],
+        sos_cfg["password"],
+        client_id_input,
+        logger,
+    ):
+        raise RuntimeError(
+            "Ese clientId existe actualmente por lo que no se puede crear. "
+            "Para modificarlo use la coleccion postman o contacte al "
+            "equipo de apigee."
+        )
+
+    client_secret_input = input(
+        "Client Secret (vacío = lo genera SOS): "
+    ).strip()
+    client_secret = client_secret_input or None
+
+    grant_mode = prompt_choice(
+        "Selecciona authorizedGrantTypes:",
+        {
+            "1": "client_credentials",
+            "2": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "3": "ambos",
+        },
+    )
+
+    grant_mode_key = {
+        "client_credentials": "1",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer": "2",
+        "ambos": "3",
+    }[grant_mode]
+
+    scopes = ask_scopes()
+
+    app_name = input("Nombre de la developer app: ").strip()
+    if not app_name:
+        raise ValueError("El nombre de la developer app no puede estar vacío.")
+
+    try:
+        available_products = fetch_apigee_products(
+            org_apigee_cfg["url_base"],
+            apigee_credentials["user"],
+            apigee_credentials["password"],
+            logger,
+        )
+    except Exception as exc:
+        logger.error(
+            "No se ha podido consultar el catálogo de productos "
+            "de Apigee: %s",
+            exc,
+        )
+        available_products = []
+
+    products = ask_products(
+        available_products,
+        "Introduce los productos de Apigee para esta app. Puedes pegar "
+        "varias líneas de una vez (por ejemplo, copiadas de un ticket); "
+        "dentro de cada línea, separa los productos por comas, espacios "
+        "o punto y coma. Pulsa Enter en una línea vacía para terminar.",
+    )
+
+    return Context(
+        org=org,
+        env=env,
+        sos_url_base=sos_cfg["url_base"],
+        sos_user=sos_cfg["user"],
+        sos_password=sos_cfg["password"],
+        apigee_url_base=org_apigee_cfg["url_base"],
+        apigee_user=apigee_credentials["user"],
+        apigee_password=apigee_credentials["password"],
+        developer_email=org_apigee_cfg["developer_email"],
+        client_id=client_id,
+        client_secret=client_secret,
+        grant_types=GRANT_MODE_MAP[grant_mode_key],
+        scopes=scopes,
+        app_name=app_name,
+        products=products,
+    )
+
+
+def create_sos_credentials(
+    ctx: Context,
+    logger: logging.Logger,
+) -> dict:
+    """Crea las credenciales OAuth en SOS."""
+    url = (
+        f"https://{ctx.sos_url_base}"
+        "/sos/manager/oauth/clients"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.sos_user,
+            ctx.sos_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    body = {
+        "accessTokenValiditySeconds": "3600",
+        "refreshTokenValiditySeconds": "3600",
+        "authorizedGrantTypes": ctx.grant_types,
+    }
+
+    if ctx.client_id:
+        body["clientId"] = ctx.client_id
+
+    if ctx.client_secret:
+        body["clientSecret"] = ctx.client_secret
+
+    logger.info("Creando credenciales SOS en %s", url)
+    logger.info(
+        "Payload SOS create: %s",
+        json.dumps(body, ensure_ascii=False),
+    )
+
+    _, response_data = http_json(
+        "POST",
+        url,
+        headers,
+        body,
+    )
+
+    logger.info(
+        "Respuesta SOS create: %s",
+        json.dumps(
+            response_data,
+            ensure_ascii=False,
+        )
+        if isinstance(response_data, dict)
+        else str(response_data),
+    )
+
+    if not isinstance(response_data, dict):
+        response_data = {}
+
+    saved_client_id = response_data.get(
+        "clientId",
+        ctx.client_id,
+    )
+
+    saved_client_secret = response_data.get(
+        "clientSecret",
+        ctx.client_secret,
+    )
+
+    with open(
+        os.path.join(LOG_DIR, "sos_credentials.json"),
+        "a",
+        encoding="utf-8",
+    ) as credentials_file:
+        credentials_file.write(
+            json.dumps(
+                {
+                    "org": ctx.org,
+                    "env": ctx.env,
+                    "clientId": saved_client_id,
+                    "clientSecret": saved_client_secret,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+    return response_data
+
+
+def add_sos_scopes(
+    ctx: Context,
+    client_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Añade scopes al client ID creado en SOS."""
+    url = (
+        f"https://{ctx.sos_url_base}"
+        "/sos/manager/oauth/clients/"
+        f"{enc(client_id)}/scopes/"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.sos_user,
+            ctx.sos_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    scopes_value = " ".join(ctx.scopes)
+
+    body = {
+        "scope": scopes_value,
+        "autoApproveScopes": scopes_value,
+        "grants": ctx.grant_types,
+    }
+
+    logger.info(
+        "Añadiendo scopes SOS a %s",
+        client_id,
+    )
+
+    logger.info(
+        "Payload SOS scopes: %s",
+        json.dumps(body, ensure_ascii=False),
+    )
+
+    http_json(
+        "POST",
+        url,
+        headers,
+        body,
+    )
+
+    logger.info("Scopes añadidos correctamente.")
+
+
+def apigee_app_exists(
+    ctx: Context,
+    app_name: str,
+    logger: logging.Logger,
+) -> bool:
+    """
+    Comprueba si ya existe una developer app con ese nombre en Apigee.
+
+    Usa la misma URL que get_apigee_app_by_name (GET .../apps/{app_name}).
+    Devuelve True si la app existe (HTTP 200), False si no (HTTP 404).
+    Cualquier otro código de error se propaga como excepción.
+    """
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps/"
+        f"{enc(app_name)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Comprobando si la developer app '%s' ya existe en Apigee.",
+        app_name,
+    )
+
+    http_request = request.Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=60) as response:
+            exists = response.status == 200
+
+            logger.info(
+                "Respuesta comprobación app '%s': HTTP %s",
+                app_name,
+                response.status,
+            )
+
+            return exists
+
+    except error.HTTPError as exc:
+        if exc.code == 404:
+            logger.info(
+                "La developer app '%s' no existe todavía en Apigee "
+                "(HTTP 404).",
+                app_name,
+            )
+            return False
+
+        raw_response = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {exc.code} comprobando la developer app '{app_name}' "
+            f"en Apigee: {raw_response}"
+        ) from exc
+
+    except error.URLError as exc:
+        raise RuntimeError(
+            f"Error de red comprobando la developer app '{app_name}' "
+            f"en Apigee: {exc.reason}"
+        ) from exc
+
+
+def create_apigee_app(
+    ctx: Context,
+    logger: logging.Logger,
+) -> dict:
+    """Crea la developer app en Apigee."""
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    body = {
+        "name": ctx.app_name,
+        "apiproducts": ctx.products,
+        "status": "approved",
+    }
+
+    logger.info(
+        "Creando developer app '%s' para developer '%s' "
+        "en org='%s', env='%s'",
+        ctx.app_name,
+        ctx.developer_email,
+        ctx.org,
+        ctx.env,
+    )
+
+    logger.info(
+        "URL Apigee app: %s",
+        url,
+    )
+
+    logger.info(
+        "Payload Apigee app: %s",
+        json.dumps(body, ensure_ascii=False),
+    )
+
+    _, response_data = http_json(
+        "POST",
+        url,
+        headers,
+        body,
+    )
+
+    logger.info(
+        "Respuesta Apigee app: %s",
+        json.dumps(
+            response_data,
+            ensure_ascii=False,
+        )
+        if isinstance(response_data, dict)
+        else str(response_data),
+    )
+
+    return (
+        response_data
+        if isinstance(response_data, dict)
+        else {}
+    )
+
+
+def get_apigee_app_by_name(
+    ctx: Context,
+    app_name: str,
+    logger: logging.Logger,
+) -> dict:
+    """Obtiene una developer app por su nombre."""
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps/"
+        f"{enc(app_name)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Consultando app Apigee por nombre: %s",
+        app_name,
+    )
+
+    _, response_data = http_json(
+        "GET",
+        url,
+        headers,
+    )
+
+    logger.info(
+        "Respuesta get app by name: %s",
+        json.dumps(
+            response_data,
+            ensure_ascii=False,
+        )
+        if isinstance(response_data, dict)
+        else str(response_data),
+    )
+
+    return (
+        response_data
+        if isinstance(response_data, dict)
+        else {}
+    )
+
+
+def create_apigee_key(
+    ctx: Context,
+    sos_client_id: str,
+    logger: logging.Logger,
+) -> dict:
+    """Crea en Apigee una key con el client ID de SOS."""
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps/"
+        f"{enc(ctx.app_name)}"
+        "/keys/create"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    body = {
+        "consumerKey": sos_client_id,
+        "consumerSecret": "",
+    }
+
+    logger.info(
+        "Creando key de Apigee con clientId SOS %s",
+        sos_client_id,
+    )
+
+    logger.info(
+        "Payload Apigee key: %s",
+        json.dumps(body, ensure_ascii=False),
+    )
+
+    _, response_data = http_json(
+        "POST",
+        url,
+        headers,
+        body,
+    )
+
+    logger.info(
+        "Respuesta Apigee key: %s",
+        json.dumps(
+            response_data,
+            ensure_ascii=False,
+        )
+        if isinstance(response_data, dict)
+        else str(response_data),
+    )
+
+    return (
+        response_data
+        if isinstance(response_data, dict)
+        else {}
+    )
+
+
+def delete_default_key(
+    ctx: Context,
+    default_key: str,
+    logger: logging.Logger,
+) -> None:
+    """Elimina la key generada automáticamente por Apigee."""
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps/"
+        f"{enc(ctx.app_name)}"
+        "/keys/"
+        f"{enc(default_key)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Eliminando key por defecto: %s",
+        default_key,
+    )
+
+    http_json(
+        "DELETE",
+        url,
+        headers,
+    )
+
+    logger.info(
+        "Key por defecto eliminada correctamente.",
+    )
+
+
+def fetch_apigee_products(
+    apigee_url_base: str,
+    apigee_user: str,
+    apigee_password: str,
+    logger: logging.Logger,
+) -> list[str]:
+    """Consulta el catálogo de productos disponibles en Apigee."""
+    url = (
+        f"https://{apigee_url_base}"
+        "/apiproducts"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            apigee_user,
+            apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Consultando productos disponibles en Apigee.",
+    )
+
+    _, response_data = http_json(
+        "GET",
+        url,
+        headers,
+    )
+
+    products = []
+
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict) and item.get("name"):
+                products.append(item["name"])
+
+    logger.info(
+        "Productos disponibles detectados: %s",
+        ", ".join(products) if products else "(ninguno)",
+    )
+
+    return products
+
+
+def list_apigee_products(
+    ctx: Context,
+    logger: logging.Logger,
+) -> list[str]:
+    """Lista los productos disponibles en Apigee."""
+    return fetch_apigee_products(
+        ctx.apigee_url_base,
+        ctx.apigee_user,
+        ctx.apigee_password,
+        logger,
+    )
+
+
+_PRODUCT_SEPARATORS = re.compile(r"[,;\s]+")
+_LEADING_BULLET = re.compile(r"^[\-\*\u2022]+\s*")
+
+
+def _extract_products_from_line(line: str) -> list[str]:
+    """
+    Extrae nombres de producto de una línea de texto.
+
+    Admite viñetas al principio de línea ("- producto", "* producto") y
+    separadores mezclados: comas, punto y coma o espacios. Cada nombre
+    se limpia de puntos y espacios sobrantes al final (habitual al pegar
+    listas copiadas de un ticket).
+    """
+    line = _LEADING_BULLET.sub("", line.strip())
+
+    return [
+        item.strip(" .")
+        for item in _PRODUCT_SEPARATORS.split(line)
+        if item.strip(" .")
+    ]
+
+
+def ask_products(
+    available_products: list[str],
+    intro: str,
+) -> list[str]:
+    """
+    Solicita productos al usuario, pensado para pegar directamente
+    desde un ticket.
+
+    - Se puede pegar todo de una vez, en varias líneas: cada línea se
+      procesa automáticamente y se sigue pidiendo hasta una línea vacía.
+    - Dentro de cada línea, los productos pueden ir separados por comas,
+      punto y coma o espacios, en cualquier combinación.
+    - Se eliminan duplicados (comparando sin distinguir mayúsculas).
+    - Si se conoce el catálogo real de Apigee, se muestra antes de pedir
+      la entrada y, al terminar, se avisa (sin bloquear) de los productos
+      introducidos que no aparezcan en ese catálogo.
+    """
+    if available_products:
+        print("\nProductos disponibles en Apigee:")
+        for product in available_products:
+            print(f" - {product}")
+    else:
+        print(
+            "\nNo se ha podido consultar el catálogo de productos "
+            "de Apigee."
+        )
+
+    print(f"\n{intro}")
+
+    products: list[str] = []
+    seen: set[str] = set()
+
+    while True:
+        raw_line = input("Producto(s): ").strip()
+
+        if not raw_line:
+            break
+
+        for item in _extract_products_from_line(raw_line):
+            key = item.lower()
+
+            if key not in seen:
+                seen.add(key)
+                products.append(item)
+
+    if available_products and products:
+        available_lower = {p.lower() for p in available_products}
+        unknown = [
+            product
+            for product in products
+            if product.lower() not in available_lower
+        ]
+
+        if unknown:
+            print(
+                "\nAviso: los siguientes productos no aparecen en el "
+                "catálogo de Apigee y podrían no existir: "
+                + ", ".join(unknown)
+            )
+
+    return products
+
+
+def add_product_to_client_id(
+    ctx: Context,
+    sos_client_id: str,
+    logger: logging.Logger,
+) -> bool:
+    """Añade los productos al client ID creado en Apigee."""
+    url = (
+        f"https://{ctx.apigee_url_base}"
+        "/developers/"
+        f"{enc(ctx.developer_email)}"
+        "/apps/"
+        f"{enc(ctx.app_name)}"
+        "/keys/"
+        f"{enc(sos_client_id)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.apigee_user,
+            ctx.apigee_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    body = {
+        "apiProducts": ctx.products,
+    }
+
+    logger.info(
+        "Añadiendo productos al clientId SOS %s",
+        sos_client_id,
+    )
+
+    logger.info(
+        "Payload add products: %s",
+        json.dumps(body, ensure_ascii=False),
+    )
+
+    try:
+        http_json(
+            "POST",
+            url,
+            headers,
+            body,
+        )
+
+        logger.info(
+            "Productos añadidos correctamente.",
+        )
+
+        return True
+
+    except Exception as exc:
+        logger.error(
+            "No se han podido añadir los productos: %s",
+            exc,
+        )
+
+        return False
+
+
+def check_sos_client_id(
+    ctx: Context,
+    sos_client_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Comprueba que el client ID existe en SOS."""
+    url = (
+        f"https://{ctx.sos_url_base}"
+        "/sos/manager/oauth/clients/"
+        f"{enc(sos_client_id)}"
+    )
+
+    headers = {
+        "Authorization": basic_auth(
+            ctx.sos_user,
+            ctx.sos_password,
+        ),
+        "Accept": "application/json",
+    }
+
+    logger.info(
+        "Comprobando clientId en SOS %s",
+        sos_client_id,
+    )
+
+    _, response_data = http_json(
+        "GET",
+        url,
+        headers,
+    )
+
+    logger.info(
+        "Respuesta SOS clientID: %s",
+        json.dumps(
+            response_data,
+            ensure_ascii=False,
+        )
+        if isinstance(response_data, dict)
+        else str(response_data),
+    )
+
+
+def extract_default_key(response_data: dict) -> str | None:
+    """Extrae la key automática generada al crear la app."""
+    credentials = response_data.get("credentials") or []
+
+    if not credentials:
+        return None
+
+    first_credential = credentials[0]
+
+    if not isinstance(first_credential, dict):
+        return None
+
+    return first_credential.get("consumerKey")
+
+
+def save_final_credentials(
+    ctx: Context,
+    sos_client_id: str,
+    sos_client_secret: str,
+) -> None:
+    """Guarda el resultado final del proceso."""
+    output_path = os.path.join(
+        LOG_DIR,
+        "final_credentials.json",
+    )
+
+    output_data = {
+        "org": ctx.org,
+        "env": ctx.env,
+        "sos": {
+            "clientId": sos_client_id,
+            "clientSecret": sos_client_secret,
+        },
+        "apigee": {
+            "developerEmail": ctx.developer_email,
+            "appName": ctx.app_name,
+            "products": ctx.products,
+        },
+    }
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as output_file:
+        json.dump(
+            output_data,
+            output_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def main() -> None:
+    """Ejecuta el flujo completo de sincronización."""
+    logger = setup_logger()
+
+    config = load_config(CONFIG_FILE)
+    context = get_context(config, logger)
+
+    logger.info(
+        "Inicio flujo org=%s env=%s developer=%s",
+        context.org,
+        context.env,
+        context.developer_email,
+    )
+
+    sos_response = create_sos_credentials(
+        context,
+        logger,
+    )
+
+    sos_client_id = sos_response.get(
+        "clientId",
+        context.client_id,
+    )
+
+    sos_client_secret = sos_response.get(
+        "clientSecret",
+        context.client_secret,
+    )
+
+    if not sos_client_id or not sos_client_secret:
+        raise RuntimeError(
+            "SOS no ha devuelto un clientId/clientSecret válido tras la "
+            "creación de las credenciales. Respuesta de SOS: "
+            f"{json.dumps(sos_response, ensure_ascii=False)}"
+        )
+
+    add_sos_scopes(
+        context,
+        sos_client_id,
+        logger,
+    )
+
+    app_exists = apigee_app_exists(
+        context,
+        context.app_name,
+        logger,
+    )
+
+    default_key = None
+
+    if app_exists:
+        logger.info(
+            "La developer app '%s' ya existe en Apigee. Se omite su "
+            "creación y el borrado de la key por defecto; solo se "
+            "añadirán las credenciales del SOS.",
+            context.app_name,
+        )
+    else:
+        app_response = create_apigee_app(
+            context,
+            logger,
+        )
+
+        default_key = extract_default_key(
+            app_response,
+        )
+
+        if not default_key:
+            app_by_name = get_apigee_app_by_name(
+                context,
+                context.app_name,
+                logger,
+            )
+
+            default_key = extract_default_key(
+                app_by_name,
+            )
+
+    create_apigee_key(
+        context,
+        sos_client_id,
+        logger,
+    )
+
+    products_added = add_product_to_client_id(
+        context,
+        sos_client_id,
+        logger,
+    )
+
+    if not products_added:
+        available_products = list_apigee_products(
+            context,
+            logger,
+        )
+
+        context.products = ask_products(
+            available_products,
+            "No se pudieron añadir los productos. Introduce de nuevo "
+            "los apiProducts (puedes pegar varias líneas; separa por "
+            "comas, espacios o punto y coma), o pulsa Enter para "
+            "omitirlos.",
+        )
+
+        if context.products:
+            products_added = add_product_to_client_id(
+                context,
+                sos_client_id,
+                logger,
+            )
+
+            if not products_added:
+                logger.error(
+                    "No se han podido añadir los productos "
+                    "tras el segundo intento."
+                )
+        else:
+            logger.info(
+                "Se omite el alta de productos "
+                "por decisión del usuario."
+            )
+
+    if app_exists:
+        logger.info(
+            "La developer app ya existía: no se borra ninguna key "
+            "por defecto."
+        )
+    elif default_key:
+        delete_default_key(
+            context,
+            default_key,
+            logger,
+        )
+    else:
+        logger.info(
+            "No se encontró default_key en la respuesta "
+            "de la app; se omite el borrado."
+        )
+
+    check_sos_client_id(
+        context,
+        sos_client_id,
+        logger,
+    )
+
+    save_final_credentials(
+        context,
+        sos_client_id,
+        sos_client_secret,
+    )
+
+    logger.info(
+        "Proceso completado correctamente.",
+    )
+
+    print("\nOK")
+    print(
+        f"Credenciales guardadas en "
+        f"{LOG_DIR}/final_credentials.json"
+    )
+    print(
+        f"Logs en {LOG_DIR}/western_sync.log"
+    )
+    print(
+        f"Developer App {context.app_name} creada con clientId "
+        f"{sos_client_id} generado en el SOS. "
+        "Contacte via Teams para obtener el secret. Gracias."
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nProceso cancelado por el usuario.")
+        sys.exit(130)
+    except Exception as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
