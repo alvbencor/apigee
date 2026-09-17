@@ -26,7 +26,7 @@ consola.
 
 - **Python 3.10 o superior** (usa sintaxis `str | None` y `dict | None`).
 - No requiere librerías externas: usa únicamente la librería estándar
-  (`urllib`, `json`, `logging`, `base64`, `uuid`, `re`, `dataclasses`).
+  (`urllib`, `json`, `logging`, `base64`, `re`, `dataclasses`).
 - Acceso de red a los endpoints de **SOS** y **Apigee** de la organización
   con la que se vaya a trabajar.
 - Credenciales válidas de Apigee y de SOS para el entorno (`dev`, `pre`,
@@ -130,17 +130,28 @@ script imprime un resumen y termina con un código de salida (ver
 
 2. **Entorno**: selección numérica entre `dev`, `pre` y `pro`.
 
-3. **Client ID**: se puede introducir manualmente o dejar vacío para que se
-   genere un UUID aleatorio.
+3. **Client ID**: se puede introducir manualmente o dejar vacío para que
+   sea **SOS** quien lo genere con su propio formato (el script ya no
+   genera ningún UUID por su cuenta).
    - Si se introduce **manualmente**, el script hace un `GET` a SOS para
      comprobar si ese `clientId` ya existe. Si existe, el script se
      **detiene** (ver detalle en
      [Validaciones incluidas](#validaciones-incluidas)).
-   - Si se deja vacío (UUID aleatorio), **no** se hace esa comprobación
-     (la probabilidad de colisión es despreciable).
+   - Si se deja vacío, **no** se hace esa comprobación (no hay nada que
+     comprobar todavía) y la clave `clientId` se omite por completo del
+     `POST` a SOS, para que sea SOS quien lo asigne.
 
-4. **Client Secret**: igual que el Client ID, manual o aleatorio (sin
-   comprobación de existencia).
+4. **Client Secret**: mismo comportamiento que el Client ID — manual o
+   vacío para que lo genere SOS. Si se deja vacío, la clave
+   `clientSecret` también se omite por completo del `POST`, no se envía
+   como cadena vacía.
+
+   > Tras la llamada de creación, el script usa el `clientId` /
+   > `clientSecret` que **devuelve SOS** en la respuesta (generado por
+   > SOS si se dejaron vacíos, o el mismo valor confirmado si se
+   > introdujeron manualmente). Si SOS no devolviera ninguno de los dos
+   > tras la creación, el script se detiene con un error explícito en
+   > vez de continuar con un valor vacío.
 
 5. **Grant types**: selección numérica entre `client_credentials`,
    `urn:ietf:params:oauth:grant-type:jwt-bearer`, o ambos.
@@ -190,6 +201,7 @@ script imprime un resumen y termina con un código de salida (ver
 | Organización | Debe tener configuración en el JSON | El script se detiene con `ValueError` |
 | Entorno / Org | Deben existir todas las claves necesarias en el JSON | El script se detiene indicando la clave concreta que falta |
 | Client ID (manual) | No debe existir ya en SOS (`GET .../oauth/clients/{clientId}` → si devuelve 200) | El script se detiene con: *"Ese clientId existe actualmente por lo que no se puede crear. Para modificarlo use la coleccion postman o contacte al equipo de apigee."* |
+| Client ID / Client Secret (tras la creación) | SOS debe devolver un `clientId` y `clientSecret` válidos en la respuesta (los introducidos manualmente, o los generados por SOS si se dejaron vacíos) | El script se detiene con un `RuntimeError` mostrando la respuesta recibida de SOS |
 | Scopes | Al menos uno introducido | Se repite la pregunta hasta introducir alguno |
 | Nombre de app | No puede estar vacío | El script se detiene con `ValueError` |
 | Productos | Se avisa si no están en el catálogo real de Apigee | No bloquea, solo informa |
@@ -274,7 +286,7 @@ en estos bloques:
 - **Modelo de datos**: `Context` (dataclass con todos los datos
   necesarios para ejecutar el flujo completo).
 - **Utilidades genéricas**: `load_config`, `setup_logger`,
-  `prompt_choice`, `basic_auth`, `random_uuid`, `enc`, `http_json`.
+  `prompt_choice`, `basic_auth`, `enc`, `http_json`.
 - **Entrada de datos por consola**: `ask_org`, `ask_scopes`,
   `ask_products`, `get_context`.
 - **Validaciones previas**: `validate_environment_config`,
@@ -288,4 +300,4 @@ en estos bloques:
 - **Cierre del proceso**: `save_final_credentials`.
 - **Orquestación**: `main()`, que encadena todo lo anterior, y el bloque
   `if __name__ == "__main__":` que gestiona la cancelación (`Ctrl+C`) y
-  cualquier error no controlado-.
+  cualquier error no controlado.
